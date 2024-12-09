@@ -1,6 +1,6 @@
 cimport cython
 import numpy as np
-from numpy cimport ndarray, int_t
+from numpy cimport ndarray, int_t, double_t
 
 DEF PEAK = 1
 DEF VALLEY = -1
@@ -60,103 +60,178 @@ def _to_ndarray(X):
     return X
 
 
-def peak_valley_pivots(X, up_thresh, down_thresh):
-    X = _to_ndarray(X)
+def peak_valley_pivots(
+    HIGH,
+    LOW,
+    CLOSE,
+    ATR,
+    vol_amp,
+    min_dev,
+    max_dev,
+    rel_edge_correction,
+    min_abs_correction_size,
+    depth,
+    allowed_zigzag_on_one_bar
+):
+    HIGH = _to_ndarray(HIGH)
+    LOW = _to_ndarray(LOW)
+    CLOSE = _to_ndarray(CLOSE)
+    ATR = _to_ndarray(ATR)
 
     # Ensure float for correct signature
-    if not str(X.dtype).startswith('float'):
-        X = X.astype(np.float64)
+    if not str(HIGH.dtype).startswith('float'):
+        HIGH = HIGH.astype(np.float64)
+    
+    if not str(LOW.dtype).startswith('float'):
+        LOW = LOW.astype(np.float64)
 
-    return peak_valley_pivots_detailed(X, up_thresh, down_thresh, True, False)
+    if not str(CLOSE.dtype).startswith('float'):
+        CLOSE = CLOSE.astype(np.float64)
+
+    if not str(ATR.dtype).startswith('float'):
+        ATR = ATR.astype(np.float64)
+
+    res, confirmed_idx = peak_valley_pivots_detailed(
+        HIGH,
+        LOW,
+        CLOSE,
+        ATR,
+        vol_amp,
+        min_dev,
+        max_dev,
+        rel_edge_correction,
+        min_abs_correction_size,
+        depth,
+        allowed_zigzag_on_one_bar,
+    )
+
+    return res, confirmed_idx
 
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef peak_valley_pivots_detailed(double [:] X,
-                                  double up_thresh,
-                                  double down_thresh,
-                                  bint limit_to_finalized_segments,
-                                  bint use_eager_switching_for_non_final):
-    """
-    Find the peaks and valleys of a series.
-
-    :param X: the series to analyze
-    :param up_thresh: minimum relative change necessary to define a peak
-    :param down_thesh: minimum relative change necessary to define a valley
-    :return: an array with 0 indicating no pivot and -1 and 1 indicating
-        valley and peak
-
-
-    The First and Last Elements
-    ---------------------------
-    The first and last elements are guaranteed to be annotated as peak or
-    valley even if the segments formed do not have the necessary relative
-    changes. This is a tradeoff between technical correctness and the
-    propensity to make mistakes in data analysis. The possible mistake is
-    ignoring data outside the fully realized segments, which may bias
-    analysis.
-    """
-    if down_thresh > 0:
-        raise ValueError('The down_thresh must be negative.')
+cpdef peak_valley_pivots_detailed(double [:] HIGH,
+                                  double [:] LOW,
+                                  double [:] CLOSE,
+                                  double [:] ATR,
+                                  double vol_amp,
+                                  double min_dev,
+                                  double max_dev,
+                                  double rel_edge_correction,
+                                  double min_abs_correction_size,
+                                  int depth,
+                                  int allowed_zigzag_on_one_bar):
 
     cdef:
-        int_t initial_pivot = identify_initial_pivot(X,
-                                                     up_thresh,
-                                                     down_thresh)
-        int_t t_n = len(X)
+        int_t t_n = len(HIGH)
         ndarray[int_t, ndim=1] pivots = np.zeros(t_n, dtype=np.int_)
-        int_t trend = -initial_pivot
-        int_t last_pivot_t = 0
-        double last_pivot_x = X[0]
-        double x, r
+        ndarray[double_t, ndim=1] edge_confirm_corrections = np.zeros(t_n, dtype=np.double)
+        ndarray[int_t, ndim=1] pivot_confirmed_ats = np.zeros(t_n, dtype=np.int_)
+        int_t last_pivot = -1
+        int_t last_pivot_direction
+        double_t last_pivot_price
+        int_t last_pivot_confirmed
+        int_t peak_candidate
+        int_t valley_candidate
 
-    pivots[0] = initial_pivot
+    for t in range(depth * 2, t_n):
+        high = HIGH[t]
+        low = LOW[t]
+        close = CLOSE[t]
+        atr = ATR[t]
 
-    # Adding one to the relative change thresholds saves operations. Instead
-    # of computing relative change at each point as x_j / x_i - 1, it is
-    # computed as x_j / x_1. Then, this value is compared to the threshold + 1.
-    # This saves (t_n - 1) subtractions.
-    up_thresh += 1
-    down_thresh += 1
+        raw_dev = atr / close * vol_amp * 100
+        # clip with min_dev and max_dev
+        clamped_vol = max(min_dev, min(max_dev, raw_dev))
+        dev_threshold = clamped_vol
+        edge_confirm_correction = dev_threshold * rel_edge_correction
+        edge_confirm_correction = max(min_abs_correction_size * 100, edge_confirm_correction) / 100
+        edge_confirm_corrections[t] = edge_confirm_correction
 
-    for t in range(1, t_n):
-        x = X[t]
-        r = x / last_pivot_x
-
-        if trend == -1:
-            if r >= up_thresh:
-                pivots[last_pivot_t] = trend
-                trend = PEAK
-                last_pivot_x = x
-                last_pivot_t = t
-            elif x < last_pivot_x:
-                last_pivot_x = x
-                last_pivot_t = t
-        else:
-            if r <= down_thresh:
-                pivots[last_pivot_t] = trend
-                trend = VALLEY
-                last_pivot_x = x
-                last_pivot_t = t
-            elif x > last_pivot_x:
-                last_pivot_x = x
-                last_pivot_t = t
-
-
-    if limit_to_finalized_segments:
-        if use_eager_switching_for_non_final:
-            if last_pivot_t > 0 and last_pivot_t < t_n-1:
-                pivots[last_pivot_t] = trend
-                pivots[t_n-1] = -trend
+        peak_candidate = 1
+        current_pivot_target = t - depth
+        current_pivot_high = HIGH[current_pivot_target]
+        for i in range(current_pivot_target - depth, current_pivot_target):
+            if HIGH[i] >= current_pivot_high:
+                peak_candidate = 0
+                break
+        for i in range(current_pivot_target + 1, current_pivot_target + depth + 1):
+            if HIGH[i] > current_pivot_high:
+                peak_candidate = 0
+                break
+        if peak_candidate == 1:
+            if last_pivot == -1:
+                last_pivot = current_pivot_target
+                last_pivot_direction = 1
+                last_pivot_price = current_pivot_high
+                last_pivot_confirmed = 0
             else:
-                pivots[t_n-1] = trend
-        else:
-            if last_pivot_t == t_n-1:
-                pivots[last_pivot_t] = trend
-            elif pivots[t_n-1] == 0:
-                pivots[t_n-1] = -trend
+                if last_pivot_direction == 1:
+                    if current_pivot_high > last_pivot_price:
+                        last_pivot = current_pivot_target
+                        last_pivot_price = current_pivot_high
+                        last_pivot_confirmed = 0
+                else:
+                    deviation_rate = (current_pivot_high - last_pivot_price) / last_pivot_price * 100
+                    if deviation_rate >= dev_threshold:
+                        last_pivot = current_pivot_target
+                        last_pivot_price = current_pivot_high
+                        last_pivot_direction = 1
+                        last_pivot_confirmed = 0
+        
+        valley_candidate = 1
+        current_pivot_target = t - depth
+        current_pivot_low = LOW[current_pivot_target]
+        for i in range(current_pivot_target - depth, current_pivot_target):
+            if LOW[i] <= current_pivot_low:
+                valley_candidate = 0
+                break
+        for i in range(current_pivot_target + 1, current_pivot_target + depth + 1):
+            if LOW[i] < current_pivot_low:
+                valley_candidate = 0
+                break
+        if last_pivot != -1 and last_pivot == current_pivot_target and allowed_zigzag_on_one_bar == 0:
+            valley_candidate = 0
+        if valley_candidate == 1:
+            if last_pivot == -1:
+                last_pivot = current_pivot_target
+                last_pivot_direction = -1
+                last_pivot_price = current_pivot_low
+                last_pivot_confirmed = 0
+            else:
+                if last_pivot_direction == -1:
+                    if current_pivot_low < last_pivot_price:
+                        last_pivot = current_pivot_target
+                        last_pivot_price = current_pivot_low
+                        last_pivot_confirmed = 0
+                else:
+                    deviation_rate = (last_pivot_price - current_pivot_low) / last_pivot_price * 100
+                    if deviation_rate >= dev_threshold:
+                        last_pivot = current_pivot_target
+                        last_pivot_price = current_pivot_low
+                        last_pivot_direction = -1
+                        last_pivot_confirmed = 0
+        if last_pivot != -1 and last_pivot_confirmed == 0:
+            if last_pivot_direction == 1:
+                for i in range(last_pivot + 1, t + 1):
+                    edge_confirm_correction = edge_confirm_corrections[i]
+                    correction = last_pivot_price / LOW[i] - 1
+                    if correction >= edge_confirm_correction:
+                        pivots[last_pivot] = PEAK
+                        last_pivot_confirmed = 1
+                        pivot_confirmed_ats[last_pivot] = t
+                        break
+            else:
+                for i in range(last_pivot + 1, t + 1):
+                    edge_confirm_correction = edge_confirm_corrections[i]
+                    correction = HIGH[i] / last_pivot_price - 1
+                    if correction >= edge_confirm_correction:
+                        pivots[last_pivot] = VALLEY
+                        last_pivot_confirmed = 1
+                        pivot_confirmed_ats[last_pivot] = t
+                        break
 
-    return pivots
+    return pivots, pivot_confirmed_ats
 
 
 def max_drawdown(X) -> float:
